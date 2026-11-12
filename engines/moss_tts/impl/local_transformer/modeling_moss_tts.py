@@ -1,5 +1,6 @@
 import os
 import copy
+import inspect
 import torch
 import torch.nn as nn
 import logging
@@ -20,7 +21,6 @@ from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.stopping_criteria import StoppingCriteriaList
 from transformers.generation.logits_process import LogitsProcessorList, RepetitionPenaltyLogitsProcessor, TopKLogitsWarper, TopPLogitsWarper, TemperatureLogitsWarper
-from transformers.masking_utils import create_causal_mask
 
 from .inference_utils import find_last_equal_C
 from .configuration_moss_tts import MossTTSDelayConfig
@@ -234,20 +234,8 @@ class MossTTSLocalTransformer(Qwen3Model):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # causal_mask = self._update_causal_mask( # ???
-        #     attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-        # )
-        mask_kwargs = {
-            "config": self.config,
-            "input_embeds": inputs_embeds,
-            "attention_mask": attention_mask,
-            "cache_position": cache_position,
-            "past_key_values": past_key_values,
-            "position_ids": position_ids,
-        }
-        causal_mask = create_causal_mask(**mask_kwargs),
-
-
+        # TTS Audio Suite patch: local attention sets is_causal=True and ignores
+        # the mask, so skip HF's unused mask builder and its changing arguments.
         hidden_states = inputs_embeds
 
         # create position embeddings to be shared across the decoder layers
@@ -263,7 +251,7 @@ class MossTTSLocalTransformer(Qwen3Model):
 
             layer_outputs = decoder_layer(
                 hidden_states,
-                attention_mask=causal_mask,
+                attention_mask=None,
                 position_ids=None,
                 past_key_values=None,
                 output_attentions=output_attentions,
@@ -350,8 +338,14 @@ class CustomMixin(GenerationMixin): # TODO 待检查正确性
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device) # (B, )
         base_length = input_ids.shape[1]
-        model_kwargs = self._get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
-        # model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
+        # TTS Audio Suite patch: recent Transformers versions removed this helper;
+        # retain cache_position initialization only for versions that still use it.
+        get_initial_cache_position = getattr(self, "_get_initial_cache_position", None)
+        if get_initial_cache_position is not None:
+            model_kwargs = get_initial_cache_position(cur_len, input_ids.device, model_kwargs)
+        uses_sequence_length = "next_sequence_length" in inspect.signature(
+            GenerationMixin.prepare_inputs_for_generation
+        ).parameters
 
         # 定义logits processor
         if generation_config.do_samples is not None:
@@ -377,6 +371,12 @@ class CustomMixin(GenerationMixin): # TODO 待检查正确性
         while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
              # 准备模型输入
             pbar.update()
+            # TTS Audio Suite patch: the new HF generation API requires explicit
+            # slicing to uncached timesteps, including MOSS's extra audio channels.
+            if uses_sequence_length and model_kwargs.get("use_cache"):
+                past_key_values = model_kwargs.get("past_key_values")
+                past_length = past_key_values.get_seq_length() if past_key_values is not None else 0
+                model_kwargs["next_sequence_length"] = input_ids.shape[1] - past_length
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
             model_inputs.update({"output_attentions": output_attentions} if output_attentions else {})
             model_inputs.update({"output_hidden_states": output_hidden_states} if output_hidden_states else {})
